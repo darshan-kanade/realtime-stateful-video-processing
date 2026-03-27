@@ -2,11 +2,8 @@ import os
 import cv2
 import time
 import base64
-from kafka import KafkaProducer, KafkaConsumer
-from apache_beam.io.kafka import ReadFromKafka
+from kafka import KafkaProducer
 import json
-import apache_beam as beam
-from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
 
 #$ bin/kafka-topics.sh --create --topic quickstart-events --bootstrap-server localhost:9092
 topic = 'quickstart-events'
@@ -18,7 +15,7 @@ producer = KafkaProducer(
 
 HOME_PATH = os.getenv('HOME')
 PROJECT_ROOT = os.path.join(HOME_PATH, 'random', 'traffic-monitoring')
-video_path = os.path.join(PROJECT_ROOT, 'inputs/53125-472583428_medium.mp4')
+video_path = os.path.join(PROJECT_ROOT, 'inputs/highway.mp4')
 
 cap = cv2.VideoCapture(video_path)
 fps = cap.get(cv2.CAP_PROP_FPS)
@@ -33,15 +30,34 @@ while cap.isOpened():
 
     print('Sending Frame:', frame_id+1)
     frame = cv2.resize(frame, None, fx=0.5, fy=0.5)
+
+    if frame_id==0:
+        bg_gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur_gray_frame = cv2.GaussianBlur(bg_gray_frame, (21, 21), 0)
+        _ = cv2.imwrite('street_backgroud_gray.jpg', blur_gray_frame)
+
     # Encode frame as JPEG bytes
     _, buffer = cv2.imencode('.jpg', frame)
     frame_bytes = base64.b64encode(buffer).decode('utf-8')
+
+    #if frame_id < 30:
+    #    movement = 0
+    #elif frame_id < 150:
+    #    movement = 1
+    #elif frame_id < 250:
+    #    movement = 0
+    #elif frame_id < 300:
+    #    movement = 1
+    #else:
+    #    movement = 0
 
     message = {
         "timestamp": time.time(),
         "frame_id": frame_id,
         "frame_rate": fps,
-        # "frame_bytes": frame_bytes
+        "frame_bytes": frame_bytes,
+        #"bg_frame_bytes": bg_frame_bytes
+        #"movement": movement,
     }
 
     future = producer.send(topic, message)
@@ -50,7 +66,7 @@ while cap.isOpened():
     time.sleep(frame_interval)  # simulate real-time streaming
     try:
         record_metadata = future.get(timeout=10)
-        print('Message sent successfully')
+        print(f'Message sent successfully at {fps} fps')
         print('Topic:', record_metadata.topic)
     except Exception as e:
         print("Error sending message:", e)
