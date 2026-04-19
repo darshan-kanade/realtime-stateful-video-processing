@@ -42,13 +42,13 @@ class DetectMovement(beam.DoFn):
     events_received = Metrics.counter('DetectMovementDoFn', 'events_received')
     events_processed = Metrics.counter('DetectMovementDoFn', 'events_processed')
     sessions_processed = Metrics.counter('DetectMovementDoFn', 'sessions_processed')
+
     EVENTS_BAG = BagStateSpec('frames', beam.coders.PickleCoder())
-    ACTIVE_STATE = ReadModifyWriteStateSpec('active', BooleanCoder())
-    EXPIRY_TIMER = TimerSpec('expiry_timer', time_domain=beam.TimeDomain.WATERMARK)
-    MAX_TIMESTAMP = CombiningValueStateSpec('max_timestamp_seen', 
-                                            IterableCoder(FloatCoder()),
-                                            lambda ele : max(ele, default=0))
-    
+    START_TIME = ReadModifyWriteStateSpec('start_time', FloatCoder())
+    LAST_SEEN_TIME = ReadModifyWriteStateSpec('last_seen_time', FloatCoder())
+    INACTIVITY_TIMER = TimerSpec('inactivity_timer', time_domain=beam.TimeDomain.WATERMARK)
+    MAX_DURATION_TIMER = TimerSpec('max_duration_timer', time_domain=beam.TimeDomain.WATERMARK)
+
     def __init__(self):
         self._distribution = Metrics.distribution('My sessions DoFn', 'movement_duration')
 
@@ -77,33 +77,26 @@ class DetectMovement(beam.DoFn):
             return {'frame': frame,
                     'movement': False}
 
-    def create_session(self, events_bag):
-        events_count = 0
-        first_event, last_event = None, None
-        for ele in events_bag.read():
-            events_count += 1
-            self.events_processed.inc()
-            if not first_event or first_event['timestamp'] > ele['timestamp']:
-                first_event = ele
-            if not last_event or last_event['timestamp'] < ele['timestamp']:
-                last_event = ele
-
-        start_time = first_event['timestamp']
-        end_time = last_event['timestamp']
-        duration = end_time - start_time
+    def create_session(self, reason, events_bag, start_time, last_seen_time):
+        events_count = sum(1 for _ in events_bag.read()) #events_bag.read().size()
+        _end_time = last_seen_time.read()
+        _start_time = start_time.read()
+        duration = _end_time - _start_time
         self._distribution.update(duration)
         session_id = uuid.uuid4()
         return {'session_id': session_id, 
-                'start_time': start_time, 
-                'end_time': end_time, 
+                'reason': reason,
+                'start_time': _start_time, 
+                'end_time': _end_time, 
                 'duration': duration, 
                 'events_processed': events_count}
 
     def process(self, element, element_timestamp: Timestamp = beam.DoFn.TimestampParam,
                 events_bag=beam.DoFn.StateParam(EVENTS_BAG),
-                active_state=beam.DoFn.StateParam(ACTIVE_STATE),
-                max_timestamp_seen=beam.DoFn.StateParam(MAX_TIMESTAMP),
-                expiry_timer=beam.DoFn.TimerParam(EXPIRY_TIMER)):
+                start_time=beam.DoFn.StateParam(START_TIME),
+                last_seen_time=beam.DoFn.StateParam(LAST_SEEN_TIME),
+                inactivity_timer=beam.DoFn.TimerParam(INACTIVITY_TIMER),
+                max_duration_timer=beam.DoFn.TimerParam(MAX_DURATION_TIMER)):
         key, msg = element
         timestamp = msg['timestamp']
         frame_id = msg['frame_id']
@@ -112,42 +105,59 @@ class DetectMovement(beam.DoFn):
         frame_bytes = base64.b64decode(frame_bytes)
         frame_array = np.frombuffer(frame_bytes, np.uint8)
         frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
-        print('Frame:', frame_id, frame.shape)
+        print(f"[{msg['movement']}] Frame:", frame_id)
 
-        result = self.detectMovementInVideo(frame)
-        if result['movement']:
-        #if msg['movement']:
-            print(f'Movement detected in frame_id: {frame_id}, timestamp: {element_timestamp.to_utc_datetime()}')
+        #result = self.detectMovementInVideo(frame)
+        # if there is presence of an object in the frame
+        #if result['movement']:
+        if msg['movement']:
             events_bag.add(element[1])
             self.events_received.inc()
-            max_timestamp_seen.add(element_timestamp.seconds())
-            if not active_state.read():
-                active_state.write(True)
-            expiration_time = Timestamp(max_timestamp_seen.read()) + Duration(seconds=30)
-            print(f'Setting timer to expire at: {expiration_time.to_utc_datetime()}')
-            expiry_timer.set(expiration_time)
-        # If session is active but the movement stopped, we end the session and clear the state
-        else:
-            if active_state.read():
-                session = self.create_session(events_bag)
-                self.sessions_processed.inc()
-                events_bag.clear()
-                max_timestamp_seen.clear()
-                active_state.clear()
-                expiry_timer.clear()
-                yield f'End session since movement stopped. Here are the details: {session}'
+            # If it's the first movement event
+            if start_time.read() is None:
+                print(f'Movement detected in frame_id: {frame_id}, timestamp: {element_timestamp.to_utc_datetime()}')
+                start_time.write(element_timestamp.seconds())
+                # Max session duration of 5 minutes
+                # This is to ensure that we don't have infinitely long sessions in case of continuous movement
+                max_duration_expiry = Timestamp(element_timestamp.seconds()) + Duration(seconds=2*60)
+                max_duration_timer.set(max_duration_expiry)
+                print(f'Setting max duration timer to expire at: {max_duration_expiry.to_utc_datetime()}')
+            last_seen_time.write(element_timestamp.seconds())
+            print(f'Movement ongoing inframe_id: {frame_id}, timestamp: {element_timestamp.to_utc_datetime()}')
+            # If no movement for 30 seconds, we consider session ended
+            # This is to account for object occlusion or brief exit from the frame, we don't want to end the session immediately
+            inactivity_expiry = Timestamp(element_timestamp.seconds()) + Duration(seconds=60)
+            inactivity_timer.set(inactivity_expiry)
+            print(f'Setting inactivity timer to expire at: {inactivity_expiry.to_utc_datetime()}')
 
-    @on_timer(EXPIRY_TIMER)
-    def expiry_timer_callback(self, events_bag=beam.DoFn.StateParam(EVENTS_BAG),
-                            active_state=beam.DoFn.StateParam(ACTIVE_STATE),
-                            max_timestamp_seen=beam.DoFn.StateParam(MAX_TIMESTAMP)):
-        session = self.create_session(events_bag)
-        self.sessions_processed.inc()
-        print(f'Expiry timer fired at: {Timestamp.now().to_utc_datetime()}, max_timestamp_seen: {max_timestamp_seen.read()}')
+    def _clear_state(self, events_bag, start_time, last_seen):
         events_bag.clear()
-        max_timestamp_seen.clear()
-        active_state.clear()
-        yield f'End session since no movement detected for 30 seconds. Here are the details: {session}'
+        start_time.clear()
+        last_seen.clear()
+    
+    @on_timer(INACTIVITY_TIMER)
+    def on_inactivity_timeout(self, events_bag=beam.DoFn.StateParam(EVENTS_BAG),
+                            start_time=beam.DoFn.StateParam(START_TIME),
+                            last_seen_time=beam.DoFn.StateParam(LAST_SEEN_TIME)):
+        if start_time.read() is not None:
+            reason = 'Inactivity'
+            session = self.create_session(reason, events_bag, start_time, last_seen_time)
+            self.sessions_processed.inc()
+            print(f'Inactivity timer fired at: {Timestamp.now().to_utc_datetime()}')
+            self._clear_state(events_bag, start_time, last_seen_time)
+            yield f'End session since no movement detected for 30 seconds. Here are the details: {session}'
+
+    @on_timer(MAX_DURATION_TIMER)
+    def on_max_duration_timeout(self, events_bag=beam.DoFn.StateParam(EVENTS_BAG),
+                                        start_time=beam.DoFn.StateParam(START_TIME),
+                                        last_seen_time=beam.DoFn.StateParam(LAST_SEEN_TIME)):
+        if start_time.read() is not None:
+            reason = 'Max Duration'
+            session = self.create_session(reason, events_bag, start_time, last_seen_time)
+            self.sessions_processed.inc()
+            print(f'Max duration timer fired at: {Timestamp.now().to_utc_datetime()}')
+            self._clear_state(events_bag, start_time, last_seen_time)
+            yield f'End session since max duration of 5 minutes reached. Here are the details: {session}'
 
 
 options = PipelineOptions(**{'num_workers': 0})

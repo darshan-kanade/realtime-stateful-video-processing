@@ -41,15 +41,15 @@ while cap.isOpened():
     frame_bytes = base64.b64encode(buffer).decode('utf-8')
 
     #if frame_id < 30:
-    #    movement = 0
+    #    movement = 1
     #elif frame_id < 150:
     #    movement = 1
     #elif frame_id < 250:
-    #    movement = 0
+    #    movement = 1
     #elif frame_id < 300:
     #    movement = 1
     #else:
-    #    movement = 0
+    #   movement = 1
 
     message = {
         "timestamp": time.time(),
